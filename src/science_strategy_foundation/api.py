@@ -9,12 +9,75 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .pilot.service import PilotService
 from .service import DomainService
 from .storage import Database
 
 
+def _pilot_routes(pilot: PilotService, method: str, path: str, body: dict[str, Any],
+                 actor_id: str) -> tuple[int, dict[str, Any]] | None:
+    """分派中试转化治理接口；未命中返回 None。"""
+
+    parsed = urlparse(path)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    query = parse_qs(parsed.query)
+
+    def posted(func) -> tuple[int, dict[str, Any]]:
+        receipt = func(actor_id=actor_id, **body)
+        return 200 if receipt.get("replayed") else 201, receipt
+
+    if method == "POST":
+        table = {
+            "/pilot/agreements": pilot.create_agreement,
+            "/pilot/ip-terms": pilot.register_ip_term,
+            "/pilot/process-versions": pilot.draft_process_version,
+            "/pilot/evidence": pilot.add_evidence,
+            "/pilot/process-versions/freeze": pilot.freeze_process_version,
+            "/pilot/scale-gates": pilot.open_scale_gate,
+            "/pilot/scale-gates/confirm": pilot.confirm_scale_gate,
+            "/pilot/materials": pilot.register_material,
+            "/pilot/materials/substitute": pilot.substitute_material,
+            "/pilot/batches": pilot.release_batch,
+            "/pilot/batches/start": pilot.start_batch,
+            "/pilot/batches/recall": pilot.recall_batch,
+            "/pilot/quality-callbacks": pilot.quality_callback,
+            "/pilot/deviations": pilot.open_deviation,
+            "/pilot/deviations/resolve": pilot.resolve_deviation,
+            "/pilot/payments/schedule": pilot.schedule_payment,
+            "/pilot/payments": pilot.record_payment,
+            "/pilot/obligations/settle": pilot.settle_obligation,
+            "/pilot/agreements/terminate": pilot.terminate_agreement,
+        }
+        if parsed.path in table:
+            return posted(table[parsed.path])
+        return None
+
+    if method == "GET" and len(segments) >= 4 and segments[0] == "pilot" and segments[1] == "agreements":
+        agreement_id = segments[2]
+        action = "/".join(segments[3:])
+        if action == "product-lineage":
+            batch_id = query.get("batch_id", [""])[0]
+            if not batch_id:
+                raise ValidationError("batch_id 不能为空")
+            return 200, pilot.product_lineage(agreement_id, batch_id)
+        if action == "dispositions":
+            batch_id = query.get("batch_id", [""])[0]
+            if not batch_id:
+                raise ValidationError("batch_id 不能为空")
+            return 200, pilot.batch_dispositions(agreement_id, batch_id)
+        if action == "financial-position":
+            return 200, pilot.financial_position(agreement_id)
+        if action == "change-impact":
+            return 200, pilot.change_impact(
+                agreement_id=agreement_id,
+                material_id=query.get("material_id", [None])[0],
+                version_id=query.get("version_id", [None])[0])
+    return None
+
+
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None, pilot: PilotService | None = None
+          ) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -25,6 +88,10 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
+        if pilot is not None and parsed.path.startswith("/pilot"):
+            pilot_result = _pilot_routes(pilot, method, path, body, actor_id)
+            if pilot_result is not None:
+                return pilot_result
         if method == "POST" and parsed.path == "/organizations":
             receipt = service.register_organization(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
@@ -59,6 +126,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    pilot: PilotService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +137,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                pilot=self.pilot)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +169,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.pilot = PilotService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
